@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"hash/crc32"
+	"net"
 	"strings"
+	"time"
 
 	"github.com/centralmind/gateway/connectors"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/centralmind/gateway/model"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
+	"golang.org/x/net/proxy"
 	"golang.org/x/xerrors"
 	"gopkg.in/yaml.v3"
 )
@@ -22,6 +26,9 @@ var docString string
 
 func init() {
 	connectors.Register(func(cfg Config) (connectors.Connector, error) {
+		if err := cfg.registerProxyDialer(); err != nil {
+			return nil, xerrors.Errorf("unable to init mysql proxy dialer: %w", err)
+		}
 		dsn, err := cfg.MakeDSN()
 		if err != nil {
 			return nil, xerrors.Errorf("unable to prepare mysql config: %w", err)
@@ -45,6 +52,7 @@ type Config struct {
 	Password   string
 	Port       int
 	TLSConfig  string
+	Proxy      string `yaml:"proxy"`
 	ConnString string `yaml:"conn_string"`
 	IsReadonly bool   `yaml:"is_readonly"`
 }
@@ -79,9 +87,22 @@ func (c Config) ExtraPrompt() []string {
 }
 
 func (c Config) MakeDSN() (string, error) {
-	// If connection string is provided, use it directly
+	proxyNet := c.proxyNetName()
+	if proxyNet != "" {
+		if err := c.registerProxyDialer(); err != nil {
+			return "", err
+		}
+	}
+
 	if c.ConnString != "" {
-		return c.ConnString, nil
+		parsed, err := mysql.ParseDSN(c.ConnString)
+		if err != nil {
+			return "", xerrors.Errorf("invalid mysql conn_string: %w", err)
+		}
+		if proxyNet != "" && (parsed.Net == "" || parsed.Net == "tcp") {
+			parsed.Net = proxyNet
+		}
+		return parsed.FormatDSN(), nil
 	}
 
 	// Otherwise, build the DSN from individual fields
@@ -95,7 +116,38 @@ func (c Config) MakeDSN() (string, error) {
 		ParseTime:            true,
 		TLSConfig:            c.TLSConfig,
 	}
+	if proxyNet != "" {
+		cfg.Net = proxyNet
+	}
 	return cfg.FormatDSN(), nil
+}
+
+func (c Config) proxyNetName() string {
+	if strings.TrimSpace(c.Proxy) == "" {
+		return ""
+	}
+	sum := crc32.ChecksumIEEE([]byte(strings.TrimSpace(c.Proxy)))
+	return fmt.Sprintf("socks5_%08x", sum)
+}
+
+func (c Config) registerProxyDialer() error {
+	proxyAddr := strings.TrimSpace(c.Proxy)
+	if proxyAddr == "" {
+		return nil
+	}
+
+	netName := c.proxyNetName()
+	forward := &net.Dialer{Timeout: 10 * time.Second}
+	d, err := proxy.SOCKS5("tcp", proxyAddr, nil, forward)
+	if err != nil {
+		return xerrors.Errorf("unable to create socks5 dialer for %s: %w", proxyAddr, err)
+	}
+
+	mysql.RegisterDialContext(netName, func(ctx context.Context, addr string) (net.Conn, error) {
+		_ = ctx
+		return d.Dial("tcp", addr)
+	})
+	return nil
 }
 
 func (c Config) Type() string {
